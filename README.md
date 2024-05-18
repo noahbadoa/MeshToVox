@@ -15,7 +15,7 @@ You can either install with `cargo install mesh_to_vox`. Or clone the repo and r
 
 ## Examples:
 `cargo install mesh_to_vox;
-mesh_to_vox -- --f data/original/person.glb --o data/test_gltf/test.gltf --dim 2048 --sparse true`
+mesh_to_vox --f data/original/person.glb --o data/test_gltf/test.gltf --dim 2048 --sparse true`
 <img src="images/Example.png" alt="example"/>
 
 ## Todo
