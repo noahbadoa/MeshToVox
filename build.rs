@@ -157,6 +157,6 @@ fn build_slang() -> std::io::Result<()>{
 // so just use slang cli for now
 // also won't work if complied in directory that cotains spaces because using cli 
 fn main(){
-    println!("cargo::rerun-if-changed=src/shaders");
-    let _ = build_slang();
+    // println!("cargo::rerun-if-changed=src/shaders");
+    // let _ = build_slang();
 }
