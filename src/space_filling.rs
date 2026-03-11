@@ -1,40 +1,21 @@
 use std::collections::HashSet;
 use crate::io::Vertex;
-use crate::octree::{Octree, OctreeCord, ALL_OCTREE_SIDES};
+use crate::octree::{ALL_OCTREE_SIDES, OCT_PERMS, Octree, OctreeCord};
 use crate::octree::octree_header;
-use crate::utils::{vec_cast, Icords};
-use crate::voxelizer::Fcords;
+use crate::utils::Icords;
+
+pub type Fcords = nalgebra::Vector3<f32>;
 type CordMap = HashSet<OctreeCord>;
 
 #[derive(Debug, Clone)]
 pub struct MeshNode{
     pub cords : Icords,
     pub dim : u8,
-    pub positive : bool,
-    pub depth : u8,
-}
-
-
-pub const fn bit_toggle(cords : Icords, depth : u32, oct : u32) -> Icords{
-    pub const fn thing(dim : i32, depth : u32, set : bool) -> i32{
-        if set{
-            dim | (1 << depth)
-        }else{
-            dim & (!(1 << depth))
-        }
-    }
-    
-    Icords::new(
-        thing(cords.x, depth, ((oct >> 0) & 1) != 0),
-        thing(cords.y, depth, ((oct >> 1) & 1) != 0),
-        thing(cords.z, depth, ((oct >> 2) & 1) != 0),
-    )
+    pub positive : bool
 }
 
 impl MeshNode{
-    
-    pub const fn to_square(&self, octree_depth : u8) -> [Icords; 2]{
-        let size = 1 << (octree_depth - self.depth);
+    const fn to_square(&self, size : i32) -> [Icords; 2]{
         let mut base: Icords = self.cords;
 
         if self.positive{
@@ -49,9 +30,8 @@ impl MeshNode{
         [base, opposite]
     }
 
-    pub const fn to_triangles(&self, octree_depth : u8) -> [[Icords; 3]; 2]{
-        let size = 1 << (octree_depth - self.depth);
-        let [base, opposite] = self.to_square(octree_depth);
+    pub const fn to_triangles(&self, size : i32) -> [[Icords; 3]; 2]{
+        let [base, opposite] = self.to_square(size);
 
         let mut corner1 = base;
         if self.dim != 0 {corner1.x += size}
@@ -73,7 +53,10 @@ impl MeshNode{
 #[derive(Debug)]
 struct FillSpaceData<'a, 'b>{
     pub next : &'a mut CordMap,
+    pub filled : &'b Octree,
     pub empty_tree : &'b mut Octree,
+    pub start : OctreeCord,
+    pub side : u8,
 }
 
 #[derive(Debug)]
@@ -82,42 +65,177 @@ struct FilledIterStruct{
     pub empty_offset : u32,
 
     pub cords : OctreeCord,
-    pub side : u8,
 }
 
 impl Octree{
-    pub fn fill_space(&self, max_size : u32) -> Vec<Vertex>{
+    fn recursive_collect_primary(adjacent : &FilledIterStruct, info : &mut FillSpaceData){
+        let filled_header: u32 = info.filled.data[adjacent.filled_offset as usize];
+        let axis = info.side % 3;
+        let positive = (info.side / 3) == 0;
+
+        let empty_header: u32 = info.empty_tree.data[adjacent.empty_offset as usize];
+        let mut cords = adjacent.cords.cords.to_array();
+        
+        let octant_size = 1 << (info.filled.depth - (info.start.depth + 1));
+        let negative_shift = 1 << (info.filled.depth - (adjacent.cords.depth + 1));
+        let negative_works = (adjacent.cords.cords.to_array()[axis as usize] % negative_shift) == 0;
+
+        let shift = if positive {octant_size} else if negative_works {-negative_shift} else {-1};
+        let out = cords[axis as usize] as i32 + shift;
+        if out < 0 || out >= (1 << info.empty_tree.depth) {return;}
+        cords[axis as usize] = out;
+
+        let cords = Icords::from_array(cords);
+        let octant : u32 = info.filled.get_oct_inverted(cords, adjacent.cords.depth) as u32;
+        if octree_header::get_final(empty_header, octant) {return;}
+
+        let filled_exist = octree_header::get_exists(filled_header, octant);
+        let empty_exist = octree_header::get_exists(empty_header, octant);
+        
+        if !filled_exist{
+            octree_header::set_exists(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            octree_header::set_final(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            let output = OctreeCord{cords, depth : adjacent.cords.depth};
+            let output = output.align(info.empty_tree.depth);
+
+            info.next.insert(output);
+            return;
+        }else if (adjacent.cords.depth + 1) == info.empty_tree.depth{
+            return;
+        }
+
+        let empty_offset = if empty_exist{
+            info.empty_tree.data[(adjacent.empty_offset + 1 + octant) as usize]
+        }else{
+            let header_index = info.empty_tree.create_new_oct(0) as u32;
+            octree_header::set_exists(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            info.empty_tree.data[(adjacent.empty_offset + 1 + octant) as usize] = header_index;
+
+            header_index
+        };
+
+        let aligned_next = info.start.depth == adjacent.cords.depth;
+
+        let mut next = FilledIterStruct{
+            filled_offset : info.filled.data[(adjacent.filled_offset + 1 + octant) as usize],
+            empty_offset,
+            cords : OctreeCord{cords : adjacent.cords.cords, depth : adjacent.cords.depth + 1}
+        };
+
+        if aligned_next{
+            let mut array = next.cords.cords.to_array();
+            array[axis as usize] += if positive {octant_size} else {0};
+            next.cords.cords = Icords::from_array(array);
+
+            Self::recursive_collect_secondary(&next, info);
+        }else{
+            Self::recursive_collect_primary(&next, info)
+        }
+    }
+
+    fn recursive_collect_secondary(adjacent : &FilledIterStruct, info : &mut FillSpaceData){
+        let axis = info.side % 3;
+
+        for oct in ALL_OCTREE_SIDES[axis as usize]{
+            Self::recursive_collect_secondary_oct(adjacent, info, oct)
+        }
+    }
+
+    fn recursive_collect_secondary_oct(adjacent : &FilledIterStruct, info : &mut FillSpaceData, oct : u8){
+        let filled_header: u32 = info.filled.data[adjacent.filled_offset as usize];
+        let axis = info.side % 3;
+        let positive = (info.side / 3) == 0;
+
+        let empty_header: u32 = info.empty_tree.data[adjacent.empty_offset as usize];
+
+        let mut octant = oct as u32;
+        if !positive {octant |= 1 << axis};
+
+        if octree_header::get_final(filled_header, octant) {return;}
+        if octree_header::get_final(empty_header, octant) {return;}
+
+        let octant_size = 1 << (info.empty_tree.depth - (adjacent.cords.depth + 1));
+        
+        let mut position = [0usize, 1, 2].map(|index|{
+            adjacent.cords.cords[index] + OCT_PERMS[oct as usize][index] * octant_size
+        });
+        
+        let cords = Icords::from_array(position);
+        if !positive {position[axis as usize] -= octant_size;}
+        let effective_cords = Icords::from_array(position);
+
+        if !(OctreeCord{cords : effective_cords, depth : adjacent.cords.depth}.in_bounds(info.filled.depth)) {return;}
+
+        let filled_exist = octree_header::get_exists(filled_header, octant);
+        let empty_exist = octree_header::get_exists(empty_header, octant);
+
+        if !filled_exist{
+            octree_header::set_exists(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            octree_header::set_final(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            let output = OctreeCord{cords : effective_cords, depth : adjacent.cords.depth};
+            info.next.insert(output);
+            return;
+        }else if (adjacent.cords.depth + 1) == info.empty_tree.depth{
+            return;
+        }
+
+        let empty_offset = if empty_exist{
+            info.empty_tree.data[(adjacent.empty_offset + 1 + octant) as usize]
+        }else{
+            let header_index = info.empty_tree.create_new_oct(0) as u32;
+            octree_header::set_exists(&mut info.empty_tree.data[adjacent.empty_offset as usize], octant);
+            info.empty_tree.data[(adjacent.empty_offset + 1 + octant) as usize] = header_index;
+
+            header_index
+        };
+
+        let next_octant = OctreeCord{cords, depth : adjacent.cords.depth + 1};
+        let new_adjcent = FilledIterStruct{
+            cords: next_octant, 
+            filled_offset : info.filled.data[(adjacent.filled_offset + 1 + octant) as usize],
+            empty_offset
+        };
+
+        Self::recursive_collect_secondary(&new_adjcent, info);
+    }
+
+    pub fn fill_space(&self, max_size : i32) -> Vec<Vertex>{
         let mut empty_tree = Octree::new(self.depth);
         let mut current : CordMap = HashSet::new();
         let mut next : CordMap = HashSet::new();
 
+
         let start = Icords::new(0, 0, 0);
-        let depth = self.insert_max_start(&mut empty_tree, start);
-        let start = OctreeCord{cords: start, depth};
+        let start_depth = self.max_empty_depth(start);
+        let start = OctreeCord{cords: start, depth : start_depth}.align(self.depth);
+        empty_tree.insert(start, image::Rgb([0; 3]));
         current.insert(start);
 
         'outer : loop{
             for cord in &current{
                 for i in 0..6{
-                    let adjcent = self.min_adjcent_depth(&mut empty_tree, &mut next, cord, i);
-                    if adjcent.is_none(){continue;}
+                    let iter_info = FilledIterStruct{filled_offset : 0, empty_offset : 0, cords : OctreeCord { cords: cord.cords, depth: 0 }};
+                    let mut thing: FillSpaceData = FillSpaceData{empty_tree : &mut empty_tree, next : &mut next, filled : self, side : i as u8, start : *cord};
 
-                    let adjcent: FilledIterStruct = adjcent.unwrap();
-                    let mut thing: FillSpaceData = FillSpaceData{empty_tree : &mut empty_tree, next : &mut next};
-                    self.recursive_collect(&adjcent, &mut thing);
+                    Self::recursive_collect_primary(&iter_info, &mut thing);
                 }
             }
 
             core::mem::swap(&mut current, &mut next);
             next.clear();
-            if current.len() == 0{break 'outer;}
+            if current.len() == 0 {break 'outer;}
         }
 
-        let nodes = Self::empty_to_mesh(self, &empty_tree);
+        Self::vis_empty(self, &empty_tree, max_size)
+        // Self::vis_tree(&empty_tree)
+    }
 
-        let triangles : Vec<_> = nodes.iter().map(|(node, color)|{
-            let color = *color;
-            let triangles = node.to_triangles(self.depth as u8);
+    fn vis_empty(full : &Self, empty : &Self, max_size : i32) -> Vec<Vertex>{
+        let nodes = Self::empty_to_mesh(full, &empty);
+        let mut output: Vec<Vertex> = Vec::new();
+
+        for (node, color) in nodes{
+            let triangles = node.to_triangles(1);
 
             let mapping = |x : Icords|{
                 let position : Fcords = x.add(-1).to_na().cast::<f32>() / max_size as f32;
@@ -128,151 +246,49 @@ impl Octree{
             let a : [Vertex; 3] = triangles[0].map(mapping);
             let b : [Vertex; 3] = triangles[1].map(mapping);
 
-            [a, b]
-        }).collect();
-        let triangles : Vec<Vertex> = vec_cast(triangles);
-
-        triangles
-    }
-
-    fn insert_max_start(&self, empty_tree : &mut Self, start : Icords) -> u32{
-        let mut empty_pointer : u32 = 0;
-        let mut filled_pointer : u32 = 0;
-
-        for d in 0..(self.depth + 1){
-            let filled_header = self.data[filled_pointer as usize];
-            let empty_header = &mut empty_tree.data[empty_pointer as usize];
-            let oct = self.get_oct_inverted(start, d) as u32;
-
-            //if octree_header::get_final(filled_header, oct as u32){panic!();}
-
-            if !octree_header::get_exists(filled_header, oct as u32){
-                octree_header::set_final(empty_header, oct as u32);
-                octree_header::set_exists(empty_header, oct as u32);
-
-                return d;
-            }
-
-            if !octree_header::get_exists(*empty_header, oct as u32){
-                octree_header::set_exists(empty_header, oct as u32);
-
-                let next = empty_tree.create_empty_oct(d);
-                empty_tree.data[(empty_pointer + 1 + oct) as usize] = next as u32;
-            }
-
-            filled_pointer = self.data[(filled_pointer + 1 + oct) as usize];
-            empty_pointer = empty_tree.data[(empty_pointer + 1 + oct) as usize];
-        }
-        //panic!();
-        unsafe{core::hint::unreachable_unchecked()}
-    }
-
-    fn min_adjcent_depth(&self, empty : &mut Self, next : &mut CordMap, cord : &OctreeCord, side : u8) -> Option<FilledIterStruct>{
-        let max_size = 1 << (self.depth + 1);
-        let min_octant_size = 1 << (self.depth - cord.depth);
-
-        let mut base = cord.cords.to_na();
-        let dim = side % 3;
-        base[dim as usize] += if side < 3{min_octant_size}else{-1};
-
-        if (base[dim as usize] >= max_size) || (base[dim as usize] < 0) {return None;}
-        
-        let adjcent = Icords::from_na(base);
-        
-        let mut empty_offset : u32 = 0;
-        let mut filled_offset : u32 = 0;
-
-        for d in 0..(cord.depth + 1){
-            let adjacent_oct = self.get_oct_inverted(adjcent, d);
-
-            let empty_header = empty.data[empty_offset as usize];
-            let filled_header = self.data[filled_offset as usize];
-
-            if octree_header::get_final(filled_header | empty_header, adjacent_oct as u32){return None}
-
-            if !octree_header::get_exists(filled_header, adjacent_oct as u32){
-                let cord = OctreeCord{cords : Icords::from_na(base), depth : d};
-                next.insert(cord);
-
-                octree_header::set_exists(&mut empty.data[empty_offset as usize], adjacent_oct as u32);
-                octree_header::set_final(&mut empty.data[empty_offset as usize], adjacent_oct as u32);
-
-                return None;
-            }
-
-            if !octree_header::get_exists(empty_header, adjacent_oct as u32){
-                let next = empty.create_empty_oct(d);
-                octree_header::set_exists(&mut empty.data[empty_offset as usize], adjacent_oct as u32);
-                empty.data[(empty_offset + 1 + adjacent_oct as u32) as usize] = next as u32;
-            }
-
-            empty_offset = empty.data[(empty_offset + 1 + adjacent_oct as u32) as usize];
-            filled_offset = self.data[(filled_offset + 1 + adjacent_oct as u32) as usize];
+            output.extend(a);
+            output.extend(b);
         }
 
-        let base = OctreeCord{cords : adjcent, depth : (cord.depth + 1)};
-        let new_cord = FilledIterStruct{cords : base, empty_offset, filled_offset, side};
-
-        return Some(new_cord);
+        output
     }
 
-    fn recursive_collect(&self, adjcent : &FilledIterStruct, info : &mut FillSpaceData){
-        let empty_header = info.empty_tree.data[adjcent.empty_offset as usize];
-        let filled_header = self.data[adjcent.filled_offset as usize];
+    fn max_empty_depth(&self, cord : Icords) -> u32{
+        let mut offset = 0;
+        for depth in 0..(self.depth + 1){
+            let oct = self.get_oct_inverted(cord, depth);
+            let header = self.data[offset as usize];
 
-        for oct in ALL_OCTREE_SIDES[adjcent.side as usize]{
-            let oct = oct as u32;
-            if octree_header::get_final(filled_header, oct){continue;}
-            if octree_header::get_final(empty_header, oct){continue;}
-
-            let pos = bit_toggle(adjcent.cords.cords, self.depth - adjcent.cords.depth, oct);
-            let octant = OctreeCord{cords : pos, depth : adjcent.cords.depth};
-
-            if !octree_header::get_exists(filled_header, oct){
-                octree_header::set_exists(&mut info.empty_tree.data[adjcent.empty_offset as usize], oct);
-                octree_header::set_final(&mut info.empty_tree.data[adjcent.empty_offset as usize], oct);
-
-                let out = octant.simplify(self.depth);
-                info.next.insert(out);
-                continue;
+            if !octree_header::get_exists(header, oct as u32){
+                return depth;
             }
 
-            if !octree_header::get_exists(empty_header, oct){
-                octree_header::set_exists(&mut info.empty_tree.data[adjcent.empty_offset as usize], oct);
-                let next = info.empty_tree.create_empty_oct(adjcent.cords.depth);
-                info.empty_tree.data[(adjcent.empty_offset + 1 + oct) as usize] = next as u32;
-            }
-
-            let filled_offset = self.data[(adjcent.filled_offset + 1 + oct) as usize];
-            let empty_offset = info.empty_tree.data[(adjcent.empty_offset + 1 + oct) as usize];
-
-            let next_octant = OctreeCord{cords : pos, depth : adjcent.cords.depth + 1};
-            let new_adjcent = FilledIterStruct{cords: next_octant, filled_offset, empty_offset, side : adjcent.side};
-            self.recursive_collect(&new_adjcent, info);
+            offset = self.data[(offset + 1 + oct as u32) as usize];
         }
+
+        unsafe{std::hint::unreachable_unchecked();}
     }
 
     fn empty_to_mesh(filled : &Self, empty : &Self) -> Vec<(MeshNode, image::Rgb<u8>)>{
         let mut mesh : Vec<(MeshNode, image::Rgb<u8>)> = Vec::new();
-
         let nodes = filled.collect_nodes();
-        let max_size = 1 << (filled.depth + 1);
 
         for (cord, value) in &nodes{
             let color = octree_header::to_color(*value);
             
             for i in 0..6{
-                let mut adjcent = cord.cords.to_na();
+                let mut adjacent = cord.cords.to_na();
                 let dim: usize = (i / 2) as usize;
                 let positive: bool = (i % 2) == 0;
 
-                adjcent[dim] += if positive {1}else{-1};
-                if adjcent[dim] >= max_size || adjcent[dim] < 0{continue;}
-                let cords = Icords::from_na(adjcent);
-                let node = OctreeCord { cords, depth: filled.depth};
+                adjacent[dim] += if positive {1} else {-1};
+                if adjacent[dim] < 0 {continue;}
+                
+                let cords = Icords::from_na(adjacent);
+                let node = OctreeCord { cords, depth: filled.depth - 1};
 
-                if empty.contains_point(&node){
-                    let mesh_node = MeshNode{cords : cord.cords, dim : dim as u8, positive, depth : filled.depth as u8};
+                if empty.contains_point(&node).all(){
+                    let mesh_node = MeshNode{cords : cord.cords, dim : dim as u8, positive};
                     mesh.push((mesh_node, color)); 
                 }
             }
@@ -281,17 +297,79 @@ impl Octree{
         mesh
     }
 
-    fn create_new_empty_oct(&mut self) -> usize{
-        let old_len = self.data.len();
-        let mut header = 0;
-        octree_header::set_header_tag(&mut header);
-        self.data.push(header);
+    #[allow(unused)]
+    pub fn vis_tree(&self, max_size : i32) -> Vec<Vertex>{
+        let mut output: Vec<Vertex> = Vec::new();
+        let nodes: Vec<(OctreeCord, u32)> = self.collect_nodes();
+        for (node, color) in nodes{
+            let (color, _) : (image::Rgb<u8>, u8) = unsafe{std::mem::transmute(color)};
     
-        old_len
-    }
-
-    fn create_empty_oct(&mut self, depth : u32) -> usize{
-        if self.depth == depth {self.create_new_empty_oct()}
-        else{self.create_new_oct(0)}
+            for side in 0..6{
+                let positive = (side / 3) == 0;
+                let axis = side % 3;
+                let mesh = MeshNode{
+                    cords : node.cords,
+                    positive,
+                    dim : axis
+                };
+                
+                let triangles = mesh.to_triangles(1 << (self.depth - (node.depth + 1)));
+                let mapping = |x : Icords|{
+                    let position : Fcords = x.add(-1).to_na().cast::<f32>() / max_size as f32;
+                    let position = (position * 2.0).add_scalar(-1.0);
+                    Vertex{position, color}
+                };
+        
+                let a : [Vertex; 3] = triangles[0].map(mapping);
+                let b : [Vertex; 3] = triangles[1].map(mapping);
+        
+                output.extend(a);
+                output.extend(b);
+            }
+        }
+        
+        output
     }
 }
+
+#[test]
+fn space_filling_test(){
+    use rand::RngExt;
+
+    let mut rng = rand::rng();
+    let depth = 8;
+
+    let dim = 1 << depth;
+    let max_size = dim - 2;
+    let mut tree = Octree::new(depth);
+
+    // sphere
+    for x in 0..dim{
+        for y in 0..dim{
+            for z in 0..dim{
+                let thingy = [x, y, z];
+                let cords = Icords::from_array(thingy.map(|x|{x as i32}));
+                let thing = thingy.map(|x|{
+                    (x as f32 / dim as f32) - 0.5
+                });
+
+                let dst = (thing[0] * thing[0] + thing[1] * thing[1] + thing[2] * thing[2]).sqrt();
+                if (dst - 0.4).abs() > (1.0 / dim as f32) {continue;}
+
+                assert!(thingy[0].min(thingy[1]).min(thingy[2]) > 0);
+                assert!(thingy[0].max(thingy[1]).max(thingy[2]) < (dim - 1));
+
+                let color = rng.random::<[u8; 3]>();
+                tree.insert(OctreeCord { cords, depth : depth - 1 }, image::Rgb(color));
+            }
+        }
+    }
+
+    let out = tree.fill_space(max_size);
+    let test_path: &str = env!("CARGO_MANIFEST_DIR");
+
+    let save_path = format!("{test_path}/test/test.gltf");
+    _ = std::fs::remove_dir_all(std::path::Path::new(save_path.as_str()).parent().unwrap());
+    crate::io::save_gltf(&out, save_path.as_str(), None, true).unwrap();
+}
+

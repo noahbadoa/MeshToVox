@@ -8,12 +8,21 @@ description = "A program to convert triangle meshes to voxels."
 license = "Unlicense"
 
 [dependencies]
-image = {version = "0.25.1"}
-gltf = {version = "1.4.0", default-features = false, features = ["import", "utils", "KHR_materials_pbrSpecularGlossiness"]}
-vox_writer = "0.1.9"
-json = {version = "0.12.4", default-features = false}
+ash = {version = "0.38.0", default-features = false, features = ["loaded", "debug"]}
+vk-mem = {version = "0.5.0", default-features = false, features = ["loaded"]}
+libc = {version = "0.2.183", default-features = false}
 
-nalgebra = {version = "0.32.0"}
-nalgebra-glm  = {version = "0.18.0"}
-clap = {version = "4.5.4", features = ["derive"]}
+gltf = {version = "1.4.1", default-features = false, features = ["import", "utils", "KHR_materials_pbrSpecularGlossiness"]}
+gltf-json = {version = "=1.4.1"}
+json = {version = "0.12.4", default-features = false}
+image = {version = "0.25.10", default-features = false, features = ["png", "jpeg"]}
+vox_writer = "0.1.9"
+tobj = {version = "4.0.3", features = [], default-features = false}
+
+nalgebra = {version = "0.34.1", default-features = false}
+clap = {version = "4.5.60", features = ["derive", "std"], default-features = false}
+
+[dev-dependencies]
+rand = "0.10.0"
+
 
